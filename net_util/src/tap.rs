@@ -7,9 +7,9 @@
 
 use std::fs::File;
 use std::io::{Error as IoError, Read, Result as IoResult, Write};
-use std::net;
 use std::os::raw::*;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::{io, net};
 
 use super::{create_sockaddr, create_socket, Error as NetUtilError};
 use libc;
@@ -227,6 +227,22 @@ impl Tap {
         }
 
         ifreq
+    }
+
+    pub fn writev(&mut self, iovec: &Vec<libc::iovec>) -> IoResult<usize> {
+        let ret = unsafe {
+            libc::writev(
+                self.tap_file.as_raw_fd(),
+                iovec.as_ptr() as *const libc::iovec,
+                iovec.len() as i32,
+            )
+        };
+
+        if ret > 0 {
+            Ok(ret as usize)
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 }
 

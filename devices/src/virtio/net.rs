@@ -444,36 +444,106 @@ impl NetEpollHandler {
             // Copy buffer from across multiple descriptors.
             // TODO(performance - Issue #420): change this to use `writev()` instead of `write()`
             // and get rid of the intermediate buffer.
-            for (desc_addr, desc_len) in self.tx.iovec.drain(..) {
-                let limit = cmp::min((read_count + desc_len) as usize, self.tx.frame_buf.len());
+            match self.mmds_ns.as_mut() {
+                Some(ns) => {
+                    // Write to MMDS
+                    for (desc_addr, desc_len) in self.tx.iovec.drain(..) {
+                        let limit =
+                            cmp::min((read_count + desc_len) as usize, self.tx.frame_buf.len());
 
-                let read_result = self.mem.read_slice_at_addr(
-                    &mut self.tx.frame_buf[read_count..limit as usize],
-                    desc_addr,
-                );
-                match read_result {
-                    Ok(sz) => {
-                        read_count += sz;
-                        METRICS.net.tx_count.inc();
+                        let read_result = self.mem.read_slice_at_addr(
+                            &mut self.tx.frame_buf[read_count..limit as usize],
+                            desc_addr,
+                        );
+                        match read_result {
+                            Ok(sz) => {
+                                read_count += sz;
+                                METRICS.net.tx_count.inc();
+                            }
+                            Err(e) => {
+                                error!("Failed to read slice: {:?}", e);
+                                METRICS.net.tx_fails.inc();
+                                break;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        error!("Failed to read slice: {:?}", e);
-                        METRICS.net.tx_fails.inc();
-                        break;
+
+                    let frame_buf = &self.tx.frame_buf[..read_count];
+                    if ns.detour_frame(frame_bytes_from_buf(frame_buf)) {
+                        METRICS.mmds.rx_accepted.inc();
+
+                        // MMDS frames are not accounted by the rate limiter.
+                        self.tx
+                            .rate_limiter
+                            .manual_replenish(frame_buf.len() as u64, TokenType::Bytes);
+                        self.tx.rate_limiter.manual_replenish(1, TokenType::Ops);
+
+                        // MMDS consumed the frame.
+                        if !self.rx.deferred_frame {
+                            process_rx_for_mmds = true;
+                        }
                     }
                 }
-            }
+                _ => {
+                    // Write to TAP
+                    let mut frame_num = 0;
+                    let mut frame_len = 0;
+                    let mut segments = vec![];
+                    for (desc_addr, desc_len) in self.tx.iovec.drain(..) {
+                        frame_len += desc_len;
 
-            if Self::write_to_mmds_or_tap(
-                self.mmds_ns.as_mut(),
-                &mut self.tx.rate_limiter,
-                &self.tx.frame_buf[..read_count],
-                &mut self.tap,
-                self.guest_mac,
-            ) && !self.rx.deferred_frame
-            {
-                // MMDS consumed this frame/request, let's also try to process the response.
-                process_rx_for_mmds = true;
+                        // read src MAC
+                        if frame_num == 0 {
+                            if let Some(mac) = self.guest_mac {
+                                let mut src_mac: [u8; 6] = [0; 6];
+                                let read_result = self.mem.read_slice_at_addr(
+                                    &mut src_mac,
+                                    desc_addr.unchecked_add(vnet_hdr_len() + 6),
+                                );
+                                match read_result {
+                                    Ok(_) => {
+                                        if mac != MacAddr::from_bytes_unchecked(&src_mac) {
+                                            METRICS.net.tx_spoofed_mac_count.inc();
+                                            warn!("tx_spoofed_mac_count");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to read src mac: {:?}", e);
+                                        METRICS.net.tx_fails.inc();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        let maybe_ptr = self.mem.get_host_address(desc_addr);
+                        match maybe_ptr {
+                            Ok(ptr) => segments.push(libc::iovec {
+                                iov_base: ptr as *mut libc::c_void,
+                                iov_len: desc_len,
+                            }),
+                            Err(e) => {
+                                error!("Failed to get host addr: {:?}", e);
+                                METRICS.net.tx_fails.inc();
+                                break;
+                            }
+                        }
+
+                        frame_num += 1;
+                    }
+
+                    match self.tap.writev(&segments) {
+                        Ok(_) => {
+                            METRICS.net.tx_bytes_count.add(frame_len);
+                            METRICS.net.tx_packets_count.inc();
+                            METRICS.net.tx_count.inc();
+                        }
+                        Err(e) => {
+                            error!("Failed to write to tap: {:?}", e);
+                            METRICS.net.tx_fails.inc();
+                        }
+                    };
+                }
             }
 
             self.tx.queue.add_used(&self.mem, head_index, 0);
