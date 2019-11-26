@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.20.0]
+
+### Added
+
+- Added support for GICv2.
 
 ### Fixed
 
