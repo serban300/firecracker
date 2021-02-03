@@ -76,6 +76,7 @@ impl Persist<'_> for Queue {
             used_ring: GuestAddress::new(state.used_ring),
             next_avail: state.next_avail,
             next_used: state.next_used,
+            wrap_counter: true,
         })
     }
 }

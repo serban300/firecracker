@@ -10,6 +10,7 @@ use std::cmp::min;
 use std::fmt;
 use std::num::Wrapping;
 use std::sync::atomic::{fence, Ordering};
+use virtio_gen::virtio_ring::{VRING_PACKED_DESC_F_AVAIL, VRING_PACKED_DESC_F_USED};
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
 };
@@ -163,6 +164,17 @@ impl<'a> DescriptorChain<'a> {
     }
 }
 
+#[repr(C)]
+#[derive(Default, Copy, Clone)]
+pub struct vring_packed_desc {
+    pub addr: u64,
+    pub len: u32,
+    pub id: u16,
+    pub flags: u16,
+}
+
+unsafe impl ByteValued for vring_packed_desc {}
+
 #[derive(Clone, Debug, PartialEq)]
 /// A virtio queue's parameters.
 pub struct Queue {
@@ -186,6 +198,8 @@ pub struct Queue {
 
     pub(crate) next_avail: Wrapping<u16>,
     pub(crate) next_used: Wrapping<u16>,
+
+    pub wrap_counter: bool,
 }
 
 impl Queue {
@@ -200,6 +214,7 @@ impl Queue {
             used_ring: GuestAddress(0),
             next_avail: Wrapping(0),
             next_used: Wrapping(0),
+            wrap_counter: true,
         }
     }
 
@@ -285,8 +300,35 @@ impl Queue {
     }
 
     /// Checks if the driver has made any descriptor chains available in the avail ring.
+    pub fn packed_is_empty(&self, mem: &GuestMemoryMmap) -> bool {
+        let desc = mem
+            .read_obj::<vring_packed_desc>(self.desc_table.unchecked_add(
+                self.next_avail.0 as u64 * std::mem::size_of::<vring_packed_desc>() as u64,
+            ))
+            .unwrap();
+
+        let avail = (desc.flags & (1 << VRING_PACKED_DESC_F_AVAIL)) != 0;
+        let used = (desc.flags & (1 << VRING_PACKED_DESC_F_USED)) != 0;
+        let is_desc_available = (avail != used) && (avail == self.wrap_counter);
+
+        !is_desc_available
+    }
+
+    /// Checks if the driver has made any descriptor chains available in the avail ring.
     pub fn is_empty(&self, mem: &GuestMemoryMmap) -> bool {
         self.len(mem) == 0
+    }
+
+    /// Pop the first available descriptor chain from the avail ring.
+    pub fn packed_pop<'a, 'b>(
+        &'a mut self,
+        mem: &'b GuestMemoryMmap,
+    ) -> Option<DescriptorChain<'b>> {
+        if self.packed_is_empty(mem) {
+            return None;
+        }
+
+        return None;
     }
 
     /// Pop the first available descriptor chain from the avail ring.

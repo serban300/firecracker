@@ -63,6 +63,7 @@ pub const VIRTIO_TRANSPORT_F_END: u32 = 33;
 pub const VIRTIO_F_NOTIFY_ON_EMPTY: u32 = 24;
 pub const VIRTIO_F_ANY_LAYOUT: u32 = 27;
 pub const VIRTIO_F_VERSION_1: u32 = 32;
+pub const VIRTIO_F_RING_PACKED: u32 = 34;
 pub const ETH_ALEN: u32 = 6;
 pub const ETH_TLEN: u32 = 2;
 pub const ETH_HLEN: u32 = 14;
