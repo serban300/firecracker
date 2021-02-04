@@ -290,11 +290,14 @@ impl Net {
         };
 
         let queue = &mut self.queues[RX_INDEX];
-        let head_descriptor = queue.pop(mem).ok_or_else(|| {
+        let head_descriptor = queue.packed_pop(mem).ok_or_else(|| {
+            error!("Empty RX Queue");
             METRICS.net.no_rx_avail_buffer.inc();
             FrontendError::EmptyQueue
         })?;
-        let head_index = head_descriptor.index;
+        let tail_buf_id = head_descriptor.buf_id;
+        let head_index = head_descriptor.desc_index;
+        let mut chain_len = 0;
 
         let mut frame_slice = &self.rx_frame_buf[..self.rx_bytes_read];
         let frame_len = frame_slice.len();
@@ -327,8 +330,16 @@ impl Net {
                 }
             };
 
+            chain_len += 1;
+
             maybe_next_descriptor = descriptor.next_descriptor();
         }
+        while let Some(descriptor) = &maybe_next_descriptor {
+            chain_len += 1;
+
+            maybe_next_descriptor = descriptor.next_descriptor();
+        }
+
         if result.is_ok() && !frame_slice.is_empty() {
             warn!("Receiving buffer is too small to hold frame of current size");
             METRICS.net.rx_fails.inc();
@@ -337,10 +348,16 @@ impl Net {
 
         // Mark the descriptor chain as used. If an error occurred, skip the descriptor chain.
         let used_len = if result.is_err() { 0 } else { frame_len as u32 };
-        queue.add_used(mem, head_index, used_len).map_err(|e| {
-            error!("Failed to add available descriptor {}: {}", head_index, e);
-            FrontendError::AddUsed
-        })?;
+        error!(
+            "Rx: used chain: buf id {}, chain_len: {}",
+            tail_buf_id, chain_len
+        );
+        queue
+            .packed_add_used(mem, head_index, tail_buf_id, chain_len, used_len)
+            .map_err(|e| {
+                error!("Failed to add available descriptor {}: {}", head_index, e);
+                FrontendError::AddUsed
+            })?;
         self.rx_deferred_irqs = true;
 
         if result.is_ok() {
@@ -640,6 +657,7 @@ impl Net {
     }
 
     pub fn process_rx_queue_event(&mut self) {
+        error!("process_rx_queue_event");
         METRICS.net.rx_queue_event_count.inc();
 
         if let Err(e) = self.queue_evts[RX_INDEX].read() {
@@ -668,7 +686,8 @@ impl Net {
         // don't process any more incoming. Otherwise start processing a frame. In the
         // process the deferred_frame flag will be set in order to avoid freezing the
         // RX queue.
-        if self.queues[RX_INDEX].is_empty(mem) && self.rx_deferred_frame {
+        if self.queues[RX_INDEX].packed_is_empty(mem) && self.rx_deferred_frame {
+            error!("process_tap_rx_event: Rx queue is empty");
             METRICS.net.no_rx_avail_buffer.inc();
             return;
         }

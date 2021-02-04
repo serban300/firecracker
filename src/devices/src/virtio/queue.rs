@@ -266,17 +266,19 @@ impl<'a> PackedDescriptorChain<'a> {
     /// the head of the next _available_ descriptor chain.
     pub fn next_descriptor(&self) -> Option<PackedDescriptorChain<'a>> {
         if self.has_next() {
+            let next_desc_index = (self.desc_index + 1) % self.queue_size;
+            let mut device_wrap_counter = self.device_wrap_counter;
+            if next_desc_index == 0 {
+                device_wrap_counter = !device_wrap_counter;
+            }
             PackedDescriptorChain::checked_new(
                 self.mem,
                 self.desc_table,
                 self.queue_size,
-                (self.desc_index + 1) % self.queue_size,
-                self.device_wrap_counter,
+                next_desc_index,
+                device_wrap_counter,
             )
             .map(|mut c| {
-                if c.desc_index == 0 {
-                    c.device_wrap_counter = !c.device_wrap_counter;
-                }
                 c.ttl = self.ttl - 1;
                 c
             })
@@ -414,15 +416,31 @@ impl Queue {
 
     /// Checks if the driver has made any descriptor chains available in the avail ring.
     pub fn packed_is_empty(&self, mem: &GuestMemoryMmap) -> bool {
-        let desc = mem
-            .read_obj::<vring_packed_desc>(self.desc_table.unchecked_add(
-                self.next_avail.0 as u64 * std::mem::size_of::<vring_packed_desc>() as u64,
-            ))
+        // // This fence ensures all subsequent reads see the updated driver writes.
+        // fence(Ordering::Acquire);
+
+        // let desc = mem
+        //     .read_obj::<vring_packed_desc>(self.desc_table.unchecked_add(
+        //         self.next_avail.0 as u64 * std::mem::size_of::<vring_packed_desc>() as u64,
+        //     ))
+        //     .unwrap();
+        // let flags = desc.flags;
+
+        let desc_addr = self.desc_table.unchecked_add(
+            self.next_avail.0 as u64 * std::mem::size_of::<vring_packed_desc>() as u64,
+        );
+        let flags = mem
+            .read_obj::<u16>(desc_addr.unchecked_add(8 + 4 + 2))
             .unwrap();
 
-        let avail = (desc.flags & (1 << VRING_PACKED_DESC_F_AVAIL)) != 0;
-        let used = (desc.flags & (1 << VRING_PACKED_DESC_F_USED)) != 0;
+        let avail = (flags & (1 << VRING_PACKED_DESC_F_AVAIL)) != 0;
+        let used = (flags & (1 << VRING_PACKED_DESC_F_USED)) != 0;
         let is_desc_available = (avail != used) && (avail == self.device_wrap_counter);
+
+        // error!(
+        //     "testing buf {} for empty: avail: {}, used: {}, is_desc_available: {}",
+        //     desc.id, avail, used, is_desc_available
+        // );
 
         !is_desc_available
     }
@@ -535,17 +553,18 @@ impl Queue {
         mem.write_obj(desc.len, desc_addr.unchecked_add(8))
             .map_err(QueueError::UsedRing)?;
 
+        let next_avail = (self.next_avail.0 + chain_len) % self.actual_size();
+        if next_avail < self.next_avail.0 {
+            self.device_wrap_counter = !self.device_wrap_counter;
+            error!("Net Queue device_wrap_counter updated");
+        }
+        self.next_avail = Wrapping(next_avail);
+
         // This fence ensures all descriptor writes are visible before the index update is.
         fence(Ordering::Release);
 
         mem.write_obj(tail_buf_id, desc_addr.unchecked_add(8 + 4))
             .map_err(QueueError::UsedRing)?;
-
-        let next_avail = (self.next_avail.0 + chain_len) % self.actual_size();
-        if next_avail < self.next_avail.0 {
-            self.device_wrap_counter = !self.device_wrap_counter;
-        }
-        self.next_avail = Wrapping(next_avail);
 
         Ok(())
     }
