@@ -175,6 +175,117 @@ pub struct vring_packed_desc {
 
 unsafe impl ByteValued for vring_packed_desc {}
 
+/// A virtio descriptor chain.
+pub struct PackedDescriptorChain<'a> {
+    desc_table: GuestAddress,
+    queue_size: u16,
+    ttl: u16, // used to prevent infinite chain cycles
+
+    /// Reference to guest memory
+    pub mem: &'a GuestMemoryMmap,
+
+    /// Index into the descriptor table
+    pub desc_index: u16,
+
+    /// Guest physical address of device specific data
+    pub addr: GuestAddress,
+
+    /// Length of device specific data
+    pub len: u32,
+
+    /// Buffer id
+    pub buf_id: u16,
+
+    /// Includes next, write, and indirect bits
+    pub flags: u16,
+
+    /// Device wrap counter
+    pub device_wrap_counter: bool,
+}
+
+impl<'a> PackedDescriptorChain<'a> {
+    fn checked_new(
+        mem: &GuestMemoryMmap,
+        desc_table: GuestAddress,
+        queue_size: u16,
+        index: u16,
+        device_wrap_counter: bool,
+    ) -> Option<PackedDescriptorChain> {
+        if index >= queue_size {
+            return None;
+        }
+
+        // These reads can't fail unless Guest memory is hopelessly broken.
+        let desc = mem
+            .read_obj::<vring_packed_desc>(
+                desc_table
+                    .unchecked_add(index as u64 * std::mem::size_of::<vring_packed_desc>() as u64),
+            )
+            .unwrap();
+
+        let chain = PackedDescriptorChain {
+            mem,
+            desc_table,
+            queue_size,
+            ttl: queue_size,
+            desc_index: index,
+            addr: GuestAddress(desc.addr),
+            len: desc.len,
+            buf_id: desc.id,
+            flags: desc.flags,
+            device_wrap_counter: device_wrap_counter,
+        };
+
+        let avail = (desc.flags & (1 << VRING_PACKED_DESC_F_AVAIL)) != 0;
+        let used = (desc.flags & (1 << VRING_PACKED_DESC_F_USED)) != 0;
+        let is_desc_available = (avail != used) && (avail == chain.device_wrap_counter);
+
+        if is_desc_available {
+            Some(chain)
+        } else {
+            None
+        }
+    }
+
+    /// Gets if this descriptor chain has another descriptor chain linked after it.
+    pub fn has_next(&self) -> bool {
+        self.flags & VIRTQ_DESC_F_NEXT != 0 && self.ttl > 1
+    }
+
+    /// If the driver designated this as a write only descriptor.
+    ///
+    /// If this is false, this descriptor is read only.
+    /// Write only means the the emulated device can write and the driver can read.
+    pub fn is_write_only(&self) -> bool {
+        self.flags & VIRTQ_DESC_F_WRITE != 0
+    }
+
+    /// Gets the next descriptor in this descriptor chain, if there is one.
+    ///
+    /// Note that this is distinct from the next descriptor chain returned by `AvailIter`, which is
+    /// the head of the next _available_ descriptor chain.
+    pub fn next_descriptor(&self) -> Option<PackedDescriptorChain<'a>> {
+        if self.has_next() {
+            PackedDescriptorChain::checked_new(
+                self.mem,
+                self.desc_table,
+                self.queue_size,
+                (self.desc_index + 1) % self.queue_size,
+                self.device_wrap_counter,
+            )
+            .map(|mut c| {
+                if c.desc_index == 0 {
+                    c.device_wrap_counter = !c.device_wrap_counter;
+                }
+                c.ttl = self.ttl - 1;
+                c
+            })
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 /// A virtio queue's parameters.
 pub struct Queue {
@@ -199,7 +310,8 @@ pub struct Queue {
     pub(crate) next_avail: Wrapping<u16>,
     pub(crate) next_used: Wrapping<u16>,
 
-    pub wrap_counter: bool,
+    pub device_wrap_counter: bool,
+    pub driver_wrap_counter: bool,
 }
 
 impl Queue {
@@ -214,7 +326,8 @@ impl Queue {
             used_ring: GuestAddress(0),
             next_avail: Wrapping(0),
             next_used: Wrapping(0),
-            wrap_counter: true,
+            device_wrap_counter: true,
+            driver_wrap_counter: true,
         }
     }
 
@@ -309,7 +422,7 @@ impl Queue {
 
         let avail = (desc.flags & (1 << VRING_PACKED_DESC_F_AVAIL)) != 0;
         let used = (desc.flags & (1 << VRING_PACKED_DESC_F_USED)) != 0;
-        let is_desc_available = (avail != used) && (avail == self.wrap_counter);
+        let is_desc_available = (avail != used) && (avail == self.device_wrap_counter);
 
         !is_desc_available
     }
@@ -323,12 +436,18 @@ impl Queue {
     pub fn packed_pop<'a, 'b>(
         &'a mut self,
         mem: &'b GuestMemoryMmap,
-    ) -> Option<DescriptorChain<'b>> {
+    ) -> Option<PackedDescriptorChain<'b>> {
         if self.packed_is_empty(mem) {
             return None;
         }
 
-        return None;
+        PackedDescriptorChain::checked_new(
+            mem,
+            self.desc_table,
+            self.actual_size(),
+            self.next_avail.0,
+            self.device_wrap_counter,
+        )
     }
 
     /// Pop the first available descriptor chain from the avail ring.
@@ -384,6 +503,51 @@ impl Queue {
     /// The caller can use this, if it was unable to consume the last popped descriptor chain.
     pub fn undo_pop(&mut self) {
         self.next_avail -= Wrapping(1);
+    }
+
+    /// Puts an available descriptor head into the used ring for use by the guest.
+    pub fn packed_add_used(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        head_desc_index: u16,
+        tail_buf_id: u16,
+        chain_len: u16,
+        data_len: u32,
+    ) -> Result<(), QueueError> {
+        if head_desc_index >= self.actual_size() {
+            error!(
+                "attempted to add out of bounds descriptor to used ring: {}",
+                head_desc_index
+            );
+            return Err(QueueError::DescIndexOutOfBounds(head_desc_index));
+        }
+
+        let desc_addr = self.desc_table.unchecked_add(
+            head_desc_index as u64 * std::mem::size_of::<vring_packed_desc>() as u64,
+        );
+        let mut desc = mem.read_obj::<vring_packed_desc>(desc_addr).unwrap();
+
+        desc.flags ^= 1 << VRING_PACKED_DESC_F_USED;
+        mem.write_obj(desc.flags, desc_addr.unchecked_add(8 + 4 + 2))
+            .map_err(QueueError::UsedRing)?;
+
+        desc.len = data_len;
+        mem.write_obj(desc.len, desc_addr.unchecked_add(8))
+            .map_err(QueueError::UsedRing)?;
+
+        // This fence ensures all descriptor writes are visible before the index update is.
+        fence(Ordering::Release);
+
+        mem.write_obj(tail_buf_id, desc_addr.unchecked_add(8 + 4))
+            .map_err(QueueError::UsedRing)?;
+
+        let next_avail = (self.next_avail.0 + chain_len) % self.actual_size();
+        if next_avail < self.next_avail.0 {
+            self.device_wrap_counter = !self.device_wrap_counter;
+        }
+        self.next_avail = Wrapping(next_avail);
+
+        Ok(())
     }
 
     /// Puts an available descriptor head into the used ring for use by the guest.

@@ -525,12 +525,17 @@ impl Net {
                 break;
             }
 
-            let head_index = head.index;
+            let head_desc_index = head.desc_index;
+            let mut tail_buf_id = head.buf_id;
+            let mut chain_len = 0;
             let mut read_count = 0;
             let mut next_desc = Some(head);
 
             self.tx_iovec.clear();
             while let Some(desc) = next_desc {
+                tail_buf_id = desc.buf_id;
+                chain_len += 1;
+
                 if desc.is_write_only() {
                     self.tx_iovec.clear();
                     break;
@@ -598,7 +603,7 @@ impl Net {
             }
 
             tx_queue
-                .add_used(mem, head_index, 0)
+                .packed_add_used(mem, head_desc_index, tail_buf_id, chain_len, 0)
                 .map_err(DeviceError::QueueError)?;
             raise_irq = true;
         }
