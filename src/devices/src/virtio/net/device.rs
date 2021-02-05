@@ -291,10 +291,10 @@ impl Net {
 
         let queue = &mut self.queues[RX_INDEX];
         let head_descriptor = queue.packed_pop(mem).ok_or_else(|| {
-            error!("Empty RX Queue");
             METRICS.net.no_rx_avail_buffer.inc();
             FrontendError::EmptyQueue
         })?;
+        let head_desc_flags = head_descriptor.flags;
         let tail_buf_id = head_descriptor.buf_id;
         let head_index = head_descriptor.desc_index;
         let mut chain_len = 0;
@@ -348,12 +348,15 @@ impl Net {
 
         // Mark the descriptor chain as used. If an error occurred, skip the descriptor chain.
         let used_len = if result.is_err() { 0 } else { frame_len as u32 };
-        error!(
-            "Rx: used chain: buf id {}, chain_len: {}",
-            tail_buf_id, chain_len
-        );
         queue
-            .packed_add_used(mem, head_index, tail_buf_id, chain_len, used_len)
+            .packed_add_used(
+                mem,
+                head_index,
+                tail_buf_id,
+                head_desc_flags,
+                chain_len,
+                used_len,
+            )
             .map_err(|e| {
                 error!("Failed to add available descriptor {}: {}", head_index, e);
                 FrontendError::AddUsed
@@ -543,14 +546,15 @@ impl Net {
             }
 
             let head_desc_index = head.desc_index;
-            let mut tail_buf_id = head.buf_id;
+            let head_desc_flags = head.flags;
+            let tail_buf_id = head.buf_id;
             let mut chain_len = 0;
             let mut read_count = 0;
             let mut next_desc = Some(head);
 
             self.tx_iovec.clear();
             while let Some(desc) = next_desc {
-                tail_buf_id = desc.buf_id;
+                // tail_buf_id = desc.buf_id;
                 chain_len += 1;
 
                 if desc.is_write_only() {
@@ -620,7 +624,14 @@ impl Net {
             }
 
             tx_queue
-                .packed_add_used(mem, head_desc_index, tail_buf_id, chain_len, 0)
+                .packed_add_used(
+                    mem,
+                    head_desc_index,
+                    tail_buf_id,
+                    head_desc_flags,
+                    chain_len,
+                    0,
+                )
                 .map_err(DeviceError::QueueError)?;
             raise_irq = true;
         }
@@ -657,7 +668,6 @@ impl Net {
     }
 
     pub fn process_rx_queue_event(&mut self) {
-        error!("process_rx_queue_event");
         METRICS.net.rx_queue_event_count.inc();
 
         if let Err(e) = self.queue_evts[RX_INDEX].read() {
@@ -687,7 +697,6 @@ impl Net {
         // process the deferred_frame flag will be set in order to avoid freezing the
         // RX queue.
         if self.queues[RX_INDEX].packed_is_empty(mem) && self.rx_deferred_frame {
-            error!("process_tap_rx_event: Rx queue is empty");
             METRICS.net.no_rx_avail_buffer.inc();
             return;
         }
