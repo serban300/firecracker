@@ -295,7 +295,6 @@ impl Net {
             FrontendError::EmptyQueue
         })?;
         let head_desc_flags = head_descriptor.flags;
-        let tail_buf_id = head_descriptor.buf_id;
         let head_index = head_descriptor.desc_index;
         let mut chain_len = 0;
 
@@ -334,10 +333,8 @@ impl Net {
 
             maybe_next_descriptor = descriptor.next_descriptor();
         }
-        while let Some(descriptor) = &maybe_next_descriptor {
-            chain_len += 1;
-
-            maybe_next_descriptor = descriptor.next_descriptor();
+        if let Some(descriptor) = &maybe_next_descriptor {
+            chain_len += descriptor.remaining_len();
         }
 
         if result.is_ok() && !frame_slice.is_empty() {
@@ -349,14 +346,7 @@ impl Net {
         // Mark the descriptor chain as used. If an error occurred, skip the descriptor chain.
         let used_len = if result.is_err() { 0 } else { frame_len as u32 };
         queue
-            .packed_add_used(
-                mem,
-                head_index,
-                tail_buf_id,
-                head_desc_flags,
-                chain_len,
-                used_len,
-            )
+            .packed_add_used(mem, head_index, head_desc_flags, chain_len, used_len)
             .map_err(|e| {
                 error!("Failed to add available descriptor {}: {}", head_index, e);
                 FrontendError::AddUsed
@@ -547,7 +537,6 @@ impl Net {
 
             let head_desc_index = head.desc_index;
             let head_desc_flags = head.flags;
-            let tail_buf_id = head.buf_id;
             let mut chain_len = 0;
             let mut read_count = 0;
             let mut next_desc = Some(head);
@@ -624,14 +613,7 @@ impl Net {
             }
 
             tx_queue
-                .packed_add_used(
-                    mem,
-                    head_desc_index,
-                    tail_buf_id,
-                    head_desc_flags,
-                    chain_len,
-                    0,
-                )
+                .packed_add_used(mem, head_desc_index, head_desc_flags, chain_len, 0)
                 .map_err(DeviceError::QueueError)?;
             raise_irq = true;
         }

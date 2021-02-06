@@ -193,9 +193,6 @@ pub struct PackedDescriptorChain<'a> {
     /// Length of device specific data
     pub len: u32,
 
-    /// Buffer id
-    pub buf_id: u16,
-
     /// Includes next, write, and indirect bits
     pub flags: u16,
 
@@ -231,7 +228,6 @@ impl<'a> PackedDescriptorChain<'a> {
             desc_index: index,
             addr: GuestAddress(desc.addr),
             len: desc.len,
-            buf_id: desc.id,
             flags: desc.flags,
             device_wrap_counter: device_wrap_counter,
         };
@@ -285,6 +281,24 @@ impl<'a> PackedDescriptorChain<'a> {
         } else {
             None
         }
+    }
+
+    pub fn remaining_len(&self) -> u16 {
+        let mut len: u16 = 1;
+        let mut flags = self.flags;
+        while flags & VIRTQ_DESC_F_NEXT != 0 {
+            let desc_addr = self.desc_table.unchecked_add(
+                ((self.desc_index + len) % self.queue_size) as u64
+                    * std::mem::size_of::<vring_packed_desc>() as u64,
+            );
+            len += 1;
+            flags = self
+                .mem
+                .read_obj::<u16>(desc_addr.unchecked_add(8 + 4 + 2))
+                .unwrap();
+        }
+
+        len
     }
 }
 
@@ -523,7 +537,6 @@ impl Queue {
         &mut self,
         mem: &GuestMemoryMmap,
         head_desc_index: u16,
-        tail_buf_id: u16,
         head_desc_flags: u16,
         chain_len: u16,
         data_len: u32,
