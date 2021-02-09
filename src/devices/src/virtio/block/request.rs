@@ -13,9 +13,9 @@ use logger::{IncMetric, METRICS};
 use virtio_gen::virtio_blk::*;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
 
-use super::super::DescriptorChain;
 use super::device::DiskProperties;
 use super::{Error, SECTOR_SHIFT, SECTOR_SIZE};
+use crate::virtio::PackedDescriptorChain;
 
 #[derive(Debug)]
 pub enum ExecuteError {
@@ -113,7 +113,7 @@ impl RequestHeader {
 
 impl Request {
     pub fn parse(
-        avail_desc: &DescriptorChain,
+        avail_desc: &PackedDescriptorChain,
         mem: &GuestMemoryMmap,
     ) -> result::Result<Request, Error> {
         // The head contains the request type which MUST be readable.

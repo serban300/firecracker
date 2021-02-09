@@ -131,6 +131,7 @@ pub const VIRTIO_RING_F_EVENT_IDX: u32 = 29;
 pub const VRING_AVAIL_ALIGN_SIZE: u32 = 2;
 pub const VRING_USED_ALIGN_SIZE: u32 = 4;
 pub const VRING_DESC_ALIGN_SIZE: u32 = 16;
+pub const VIRTIO_F_RING_PACKED: u32 = 34;
 pub type __u_char = ::std::os::raw::c_uchar;
 pub type __u_short = ::std::os::raw::c_ushort;
 pub type __u_int = ::std::os::raw::c_uint;

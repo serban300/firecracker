@@ -29,6 +29,7 @@ use super::{
 
 use crate::virtio::VIRTIO_MMIO_INT_CONFIG;
 use crate::Error as DeviceError;
+use virtio_gen::virtio_ring::VIRTIO_F_RING_PACKED;
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
@@ -162,7 +163,9 @@ impl Block {
     ) -> io::Result<Block> {
         let disk_properties = DiskProperties::new(disk_image_path, is_disk_read_only)?;
 
-        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH);
+        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_BLK_F_FLUSH)
+            | (1u64 << VIRTIO_F_RING_PACKED);
 
         if is_disk_read_only {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
@@ -226,7 +229,9 @@ impl Block {
         };
         let queue = &mut self.queues[queue_index];
         let mut used_any = false;
-        while let Some(head) = queue.pop(mem) {
+
+        while let Some(head) = queue.packed_pop(mem) {
+            let mut chain_len = 0;
             let len;
             match Request::parse(&head, mem) {
                 Ok(request) => {
@@ -258,6 +263,11 @@ impl Block {
                             break;
                         }
                     }
+
+                    chain_len = match request.request_type {
+                        RequestType::Flush => 2,
+                        _ => 3,
+                    };
 
                     let status = match request.execute(&mut self.disk, mem) {
                         Ok(l) => {
@@ -313,12 +323,14 @@ impl Block {
                 }
             }
 
-            queue.add_used(mem, head.index, len).unwrap_or_else(|e| {
-                error!(
-                    "Failed to add available descriptor head {}: {}",
-                    head.index, e
-                )
-            });
+            queue
+                .packed_add_used(mem, head.desc_index, head.flags, chain_len, len)
+                .unwrap_or_else(|e| {
+                    error!(
+                        "Failed to add available descriptor head {}: {}",
+                        head.desc_index, e
+                    )
+                });
             used_any = true;
         }
 
