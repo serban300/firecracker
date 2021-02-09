@@ -114,6 +114,8 @@ pub struct Net {
     tx_iovec: Vec<(GuestAddress, usize)>,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
 
+    rx_start_time: u64,
+
     pub(crate) interrupt_status: Arc<AtomicUsize>,
     pub(crate) interrupt_evt: EventFd,
 
@@ -205,6 +207,7 @@ impl Net {
 
             #[cfg(test)]
             mocks: Mocks::default(),
+            rx_start_time: 0,
         })
     }
 
@@ -357,6 +360,13 @@ impl Net {
             METRICS.net.rx_bytes_count.add(frame_len);
             METRICS.net.rx_packets_count.inc();
         }
+
+        let rx_end_time = utils::time::get_time_ns(utils::time::ClockType::Real);
+        error!(
+            "Packet processing time: {}",
+            rx_end_time - self.rx_start_time
+        );
+
         result
     }
 
@@ -438,6 +448,7 @@ impl Net {
 
     // We currently prioritize packets from the MMDS over regular network packets.
     fn read_from_mmds_or_tap(&mut self) -> Result<usize> {
+        self.rx_start_time = utils::time::get_time_ns(utils::time::ClockType::Real);
         if let Some(ns) = self.mmds_ns.as_mut() {
             if let Some(len) =
                 ns.write_next_frame(frame_bytes_from_buf_mut(&mut self.rx_frame_buf)?)
