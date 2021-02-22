@@ -6,12 +6,13 @@
 // found in the THIRD-PARTY file.
 
 use std::convert::From;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Write};
+use std::os::unix::io::AsRawFd;
 use std::result;
 
 use logger::{IncMetric, METRICS};
 use virtio_gen::virtio_blk::*;
-use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
+use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap};
 
 use super::super::DescriptorChain;
 use super::device::{CacheType, DiskProperties};
@@ -196,27 +197,72 @@ impl Request {
 
         let cache_type = disk.cache_type();
         let diskfile = disk.file_mut();
-        diskfile
-            .seek(SeekFrom::Start(self.sector << SECTOR_SHIFT))
-            .map_err(ExecuteError::Seek)?;
+
+        let s = mem
+            .get_slice(self.data_addr, self.data_len as usize)
+            .unwrap();
+        let fd = diskfile.as_raw_fd();
 
         match self.request_type {
-            RequestType::In => mem
-                .read_exact_from(self.data_addr, diskfile, self.data_len as usize)
-                .map(|_| {
-                    METRICS.block.read_bytes.add(self.data_len as usize);
-                    METRICS.block.read_count.inc();
-                    self.data_len
-                })
-                .map_err(ExecuteError::Read),
-            RequestType::Out => mem
-                .write_all_to(self.data_addr, diskfile, self.data_len as usize)
-                .map(|_| {
-                    METRICS.block.write_bytes.add(self.data_len as usize);
-                    METRICS.block.write_count.inc();
-                    0
-                })
-                .map_err(ExecuteError::Write),
+            RequestType::In => {
+                let read_result = unsafe {
+                    libc::pread(
+                        fd,
+                        s.as_ptr() as *mut libc::c_void,
+                        self.data_len as usize,
+                        (self.sector << SECTOR_SHIFT) as i64,
+                    )
+                };
+                if read_result < 0 {
+                    return Err(ExecuteError::Read(GuestMemoryError::IOError(
+                        std::io::Error::last_os_error(),
+                    )));
+                }
+                if read_result != self.data_len as isize {
+                    return Err(ExecuteError::Read(GuestMemoryError::PartialBuffer {
+                        expected: self.data_len as usize,
+                        completed: read_result as usize,
+                    }));
+                }
+
+                METRICS.block.read_bytes.add(self.data_len as usize);
+                METRICS.block.read_count.inc();
+                return Ok(self.data_len);
+            }
+            RequestType::Out => {
+                let write_result = unsafe {
+                    libc::pwrite(
+                        fd,
+                        s.as_ptr() as *const libc::c_void,
+                        self.data_len as usize,
+                        (self.sector << SECTOR_SHIFT) as i64,
+                    )
+                };
+                if write_result < 0 {
+                    return Err(ExecuteError::Write(GuestMemoryError::IOError(
+                        std::io::Error::last_os_error(),
+                    )));
+                }
+                if write_result != self.data_len as isize {
+                    return Err(ExecuteError::Write(GuestMemoryError::PartialBuffer {
+                        expected: self.data_len as usize,
+                        completed: write_result as usize,
+                    }));
+                }
+
+                METRICS.block.write_bytes.add(self.data_len as usize);
+                METRICS.block.write_count.inc();
+                return Ok(self.data_len);
+
+                // mem
+                //     .write_all_to(self.data_addr, diskfile, self.data_len as usize)
+                //     .map(|_| {
+                //         METRICS.block.write_bytes.add(self.data_len as usize);
+                //         METRICS.block.write_count.inc();
+                //         0
+                //     })
+                //     .map_err(ExecuteError::Write)
+            }
             RequestType::Flush => {
                 match cache_type {
                     CacheType::Writeback => {

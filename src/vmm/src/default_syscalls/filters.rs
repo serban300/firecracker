@@ -159,6 +159,8 @@ pub fn default_filter() -> Result<SeccompFilter, Error> {
                 or![and![Cond::new(1, ArgLen::DWORD, Eq, 0u64)?],],
             ),
             allow_syscall(libc::SYS_fsync),
+            allow_syscall(libc::SYS_pread64),
+            allow_syscall(libc::SYS_pwrite64),
             allow_syscall(libc::SYS_write),
         ]
         .into_iter()
