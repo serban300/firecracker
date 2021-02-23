@@ -6,6 +6,7 @@ pub mod event_handler;
 pub mod persist;
 pub mod request;
 pub mod test_utils;
+pub mod transfer;
 
 pub use self::device::{Block, CacheType};
 pub use self::event_handler::*;
@@ -36,4 +37,11 @@ pub enum Error {
     UnexpectedReadOnlyDescriptor,
     /// Guest gave us a write only descriptor that protocol says to read from.
     UnexpectedWriteOnlyDescriptor,
+}
+
+pub struct TransferUserData {
+    pub request_type: RequestType,
+    pub status_addr: u64,
+    pub head_index: u16,
+    pub len: u32,
 }

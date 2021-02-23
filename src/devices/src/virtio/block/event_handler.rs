@@ -63,12 +63,14 @@ impl Subscriber for Block {
             let queue_evt = self.queue_evts[0].as_raw_fd();
             let rate_limiter_evt = self.rate_limiter.as_raw_fd();
             let activate_fd = self.activate_evt.as_raw_fd();
+            let completion_evt = self.io_uring_engine.completion_evt().as_raw_fd();
 
             // Looks better than C style if/else if/else.
             match source {
                 _ if queue_evt == source => self.process_queue_event(),
                 _ if rate_limiter_evt == source => self.process_rate_limiter_event(),
                 _ if activate_fd == source => self.process_activate_event(evmgr),
+                _ if completion_evt == source => self.process_completion_event(),
                 _ => warn!("Block: Spurious event received: {:?}", source),
             }
         } else {
@@ -85,10 +87,15 @@ impl Subscriber for Block {
         //  - on device activation (is-activated already true at this point),
         //  - on device restore from snapshot.
         if self.is_activated() {
-            vec![
+            let interest_list = vec![
                 EpollEvent::new(EventSet::IN, self.queue_evts[0].as_raw_fd() as u64),
                 EpollEvent::new(EventSet::IN, self.rate_limiter.as_raw_fd() as u64),
-            ]
+                EpollEvent::new(
+                    EventSet::IN,
+                    self.io_uring_engine.completion_evt().as_raw_fd() as u64,
+                ),
+            ];
+            interest_list
         } else {
             vec![EpollEvent::new(
                 EventSet::IN,
