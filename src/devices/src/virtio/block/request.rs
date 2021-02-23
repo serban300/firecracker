@@ -6,16 +6,19 @@
 // found in the THIRD-PARTY file.
 
 use std::convert::From;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Write};
+use std::os::unix::io::AsRawFd;
 use std::result;
 
 use logger::{IncMetric, METRICS};
 use virtio_gen::virtio_blk::*;
-use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
+use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
 
 use super::super::DescriptorChain;
 use super::device::{CacheType, DiskProperties};
 use super::{Error, SECTOR_SHIFT, SECTOR_SIZE};
+use crate::virtio::transfer::IoUringTransferEngine;
+use crate::virtio::TransferUserData;
 
 #[derive(Debug)]
 pub enum ExecuteError {
@@ -182,6 +185,8 @@ impl Request {
         &self,
         disk: &mut DiskProperties,
         mem: &GuestMemoryMmap,
+        transfer_engine: &mut IoUringTransferEngine,
+        head_index: u16,
     ) -> result::Result<u32, ExecuteError> {
         let mut top: u64 = u64::from(self.data_len) / SECTOR_SIZE;
         if u64::from(self.data_len) % SECTOR_SIZE != 0 {
@@ -196,27 +201,45 @@ impl Request {
 
         let cache_type = disk.cache_type();
         let diskfile = disk.file_mut();
-        diskfile
-            .seek(SeekFrom::Start(self.sector << SECTOR_SHIFT))
-            .map_err(ExecuteError::Seek)?;
+        // diskfile
+        //     .seek(SeekFrom::Start(self.sector << SECTOR_SHIFT))
+        //     .map_err(ExecuteError::Seek)?;
 
         match self.request_type {
-            RequestType::In => mem
-                .read_exact_from(self.data_addr, diskfile, self.data_len as usize)
-                .map(|_| {
-                    METRICS.block.read_bytes.add(self.data_len as usize);
-                    METRICS.block.read_count.inc();
-                    self.data_len
-                })
-                .map_err(ExecuteError::Read),
-            RequestType::Out => mem
-                .write_all_to(self.data_addr, diskfile, self.data_len as usize)
-                .map(|_| {
-                    METRICS.block.write_bytes.add(self.data_len as usize);
-                    METRICS.block.write_count.inc();
-                    0
-                })
-                .map_err(ExecuteError::Write),
+            RequestType::In => {
+                transfer_engine
+                    .push_read(
+                        diskfile.as_raw_fd(),
+                        (self.sector << SECTOR_SHIFT) as i64,
+                        mem,
+                        self.data_addr,
+                        self.data_len,
+                        TransferUserData {
+                            status_addr: self.status_addr.raw_value(),
+                            head_index,
+                            len: self.data_len,
+                        },
+                    )
+                    .unwrap();
+                Ok(self.data_len)
+            }
+            RequestType::Out => {
+                transfer_engine
+                    .push_write(
+                        diskfile.as_raw_fd(),
+                        (self.sector << SECTOR_SHIFT) as i64,
+                        mem,
+                        self.data_addr,
+                        self.data_len,
+                        TransferUserData {
+                            status_addr: self.status_addr.raw_value(),
+                            head_index,
+                            len: self.data_len,
+                        },
+                    )
+                    .unwrap();
+                Ok(self.data_len)
+            }
             RequestType::Flush => {
                 match cache_type {
                     CacheType::Writeback => {

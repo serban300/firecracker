@@ -19,7 +19,7 @@ use logger::{error, warn, IncMetric, METRICS};
 use rate_limiter::{BucketUpdate, RateLimiter, TokenType};
 use utils::eventfd::EventFd;
 use virtio_gen::virtio_blk::*;
-use vm_memory::{Bytes, GuestMemoryError, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
 
 use super::{
     super::{ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_BLOCK, VIRTIO_MMIO_INT_VRING},
@@ -27,9 +27,10 @@ use super::{
     Error, CONFIG_SPACE_SIZE, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
-use crate::virtio::VIRTIO_MMIO_INT_CONFIG;
+use crate::virtio::{TransferUserData, VIRTIO_MMIO_INT_CONFIG};
 use crate::Error as DeviceError;
 
+use crate::virtio::transfer::IoUringTransferEngine;
 use serde::{Deserialize, Serialize};
 
 /// Configuration options for disk caching.
@@ -197,6 +198,8 @@ pub struct Block {
     pub(crate) partuuid: Option<String>,
     pub(crate) root_device: bool,
     pub(crate) rate_limiter: RateLimiter,
+
+    pub(crate) io_uring_engine: IoUringTransferEngine,
 }
 
 impl Block {
@@ -239,6 +242,7 @@ impl Block {
             queues,
             device_state: DeviceState::Inactive,
             activate_evt: EventFd::new(libc::EFD_NONBLOCK)?,
+            io_uring_engine: IoUringTransferEngine::new()?,
         })
     }
 
@@ -278,10 +282,13 @@ impl Block {
         };
         let queue = &mut self.queues[queue_index];
         let mut used_any = false;
+        let mut request_type = RequestType::In;
         while let Some(head) = queue.pop(mem) {
-            let len;
+            let mut len = 0;
             match Request::parse(&head, mem) {
                 Ok(request) => {
+                    request_type = request.request_type;
+
                     // If limiter.consume() fails it means there is no more TokenType::Ops
                     // budget and rate limiting is in effect.
                     if !self.rate_limiter.consume(1, TokenType::Ops) {
@@ -311,22 +318,13 @@ impl Block {
                         }
                     }
 
-                    let status = match request.execute(&mut self.disk, mem) {
-                        Ok(l) => {
-                            // Account for the status byte as well.
-                            // With a non-faulty driver, we shouldn't get to the point where we
-                            // overflow here (since data len must be a multiple of 512 bytes, so
-                            // it can't be u32::MAX). In the future, this should be fixed at the
-                            // request parsing level, so no data will actually be transferred in
-                            // scenarios like this one.
-                            if let Some(l) = l.checked_add(1) {
-                                len = l;
-                                VIRTIO_BLK_S_OK
-                            } else {
-                                len = l;
-                                VIRTIO_BLK_S_IOERR
-                            }
-                        }
+                    let status = match request.execute(
+                        &mut self.disk,
+                        mem,
+                        &mut self.io_uring_engine,
+                        head.index,
+                    ) {
+                        Ok(_l) => VIRTIO_BLK_S_OK,
                         Err(e) => {
                             METRICS.block.invalid_reqs_count.inc();
                             match e {
@@ -365,20 +363,70 @@ impl Block {
                 }
             }
 
-            queue.add_used(mem, head.index, len).unwrap_or_else(|e| {
-                error!(
-                    "Failed to add available descriptor head {}: {}",
-                    head.index, e
-                )
-            });
-            used_any = true;
+            if request_type != RequestType::In && request_type != RequestType::Out {
+                queue.add_used(mem, head.index, len).unwrap_or_else(|e| {
+                    error!(
+                        "Failed to add available descriptor head {}: {}",
+                        head.index, e
+                    )
+                });
+                used_any = true;
+            }
         }
 
         if !used_any {
             METRICS.block.no_avail_buffer.inc();
         }
+        self.io_uring_engine.submit().unwrap();
 
         used_any
+    }
+
+    pub(crate) fn process_completion_event(&mut self) {
+        if let Err(e) = self.io_uring_engine.completion_evt().read() {
+            error!("Failed to get completion event: {:?}", e);
+            return;
+        }
+
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem) => mem,
+            // This should never happen, it's been already validated in the event handler.
+            DeviceState::Inactive => unreachable!(),
+        };
+        let queue = &mut self.queues[0];
+
+        while let Some(cqe) = self.io_uring_engine.pop_cqe::<TransferUserData>() {
+            match cqe {
+                Ok((count, user_data)) => {
+                    let status = if count == user_data.len {
+                        VIRTIO_BLK_S_OK
+                    } else {
+                        VIRTIO_BLK_S_IOERR
+                    };
+                    let len = count + 1;
+
+                    if let Err(e) = mem.write_obj(status, GuestAddress(user_data.status_addr)) {
+                        error!("Failed to write virtio block status: {:?}", e)
+                    }
+
+                    queue
+                        .add_used(mem, user_data.head_index, len)
+                        .unwrap_or_else(|e| {
+                            error!(
+                                "Failed to add available descriptor head {}: {}",
+                                user_data.head_index, e
+                            )
+                        });
+                }
+                Err(e) => {
+                    error!("io_uring operation failed: {}", e);
+                }
+            }
+        }
+
+        if self.io_uring_engine.unprocessed() == 0 {
+            self.signal_used_queue().unwrap();
+        }
     }
 
     pub(crate) fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
