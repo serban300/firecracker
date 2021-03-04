@@ -1,7 +1,7 @@
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use super::QUEUE_SIZE;
-use io_uring::IoUring;
+use io_uring::{IoUring};
 use utils::eventfd::EventFd;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap};
 
@@ -25,11 +25,13 @@ pub struct IoUringTransferEngine {
 }
 
 impl IoUringTransferEngine {
-    pub fn new() -> std::io::Result<IoUringTransferEngine> {
+    pub fn new(fd: RawFd) -> std::io::Result<IoUringTransferEngine> {
         let ring = IoUring::new(QUEUE_SIZE as u32)?;
         let completion_evt = EventFd::new(libc::EFD_NONBLOCK)?;
         ring.submitter()
             .register_eventfd(completion_evt.as_raw_fd())?;
+
+        ring.submitter().register_files(&[fd])?;
 
         Ok(IoUringTransferEngine {
             ring,
@@ -78,7 +80,7 @@ impl IoUringTransferEngine {
         });
 
         let sqe = io_uring::opcode::Readv::new(
-            io_uring::opcode::types::Fd(fd),
+            io_uring::opcode::types::Fixed(0),
             boxed_user_data.iovec.as_ptr(),
             1,
         )
@@ -112,7 +114,7 @@ impl IoUringTransferEngine {
         });
 
         let sqe = io_uring::opcode::Writev::new(
-            io_uring::opcode::types::Fd(fd),
+            io_uring::opcode::types::Fixed(0),
             boxed_user_data.iovec.as_ptr(),
             1,
         )

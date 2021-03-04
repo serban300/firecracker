@@ -10,6 +10,7 @@ use std::convert::From;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::linux::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::result;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -216,6 +217,7 @@ impl Block {
         rate_limiter: RateLimiter,
     ) -> io::Result<Block> {
         let disk_properties = DiskProperties::new(disk_image_path, is_disk_read_only, cache_type)?;
+        let fd = disk_properties.file.as_raw_fd();
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH);
 
@@ -242,7 +244,7 @@ impl Block {
             queues,
             device_state: DeviceState::Inactive,
             activate_evt: EventFd::new(libc::EFD_NONBLOCK)?,
-            io_uring_engine: IoUringTransferEngine::new()?,
+            io_uring_engine: IoUringTransferEngine::new(fd)?,
         })
     }
 
