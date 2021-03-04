@@ -363,7 +363,7 @@ impl Block {
                 }
             }
 
-            if request_type != RequestType::In && request_type != RequestType::Out {
+            if request_type != RequestType::In {
                 queue.add_used(mem, head.index, len).unwrap_or_else(|e| {
                     error!(
                         "Failed to add available descriptor head {}: {}",

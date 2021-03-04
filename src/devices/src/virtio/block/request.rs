@@ -6,7 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::convert::From;
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::result;
 
@@ -201,9 +201,6 @@ impl Request {
 
         let cache_type = disk.cache_type();
         let diskfile = disk.file_mut();
-        // diskfile
-        //     .seek(SeekFrom::Start(self.sector << SECTOR_SHIFT))
-        //     .map_err(ExecuteError::Seek)?;
 
         match self.request_type {
             RequestType::In => {
@@ -224,21 +221,31 @@ impl Request {
                 Ok(self.data_len)
             }
             RequestType::Out => {
-                transfer_engine
-                    .push_write(
-                        diskfile.as_raw_fd(),
-                        (self.sector << SECTOR_SHIFT) as i64,
-                        mem,
-                        self.data_addr,
-                        self.data_len,
-                        TransferUserData {
-                            status_addr: self.status_addr.raw_value(),
-                            head_index,
-                            len: self.data_len,
-                        },
-                    )
-                    .unwrap();
-                Ok(self.data_len)
+                diskfile
+                    .seek(SeekFrom::Start(self.sector << SECTOR_SHIFT))
+                    .map_err(ExecuteError::Seek)?;
+                mem.write_all_to(self.data_addr, diskfile, self.data_len as usize)
+                    .map(|_| {
+                        METRICS.block.write_bytes.add(self.data_len as usize);
+                        METRICS.block.write_count.inc();
+                        0
+                    })
+                    .map_err(ExecuteError::Write)
+                // transfer_engine
+                //     .push_write(
+                //         diskfile.as_raw_fd(),
+                //         (self.sector << SECTOR_SHIFT) as i64,
+                //         mem,
+                //         self.data_addr,
+                //         self.data_len,
+                //         TransferUserData {
+                //             status_addr: self.status_addr.raw_value(),
+                //             head_index,
+                //             len: self.data_len,
+                //         },
+                //     )
+                //     .unwrap();
+                // Ok(self.data_len)
             }
             RequestType::Flush => {
                 match cache_type {
