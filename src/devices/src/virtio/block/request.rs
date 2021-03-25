@@ -6,8 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::convert::From;
-use std::io::{self, Write};
-use std::os::unix::io::AsRawFd;
+use std::io::{self};
 use std::result;
 
 use logger::{error, IncMetric, METRICS};
@@ -200,15 +199,10 @@ impl Request {
         }
 
         let cache_type = disk.cache_type();
-        let diskfile = disk.file_mut();
-        // diskfile
-        //     .seek(SeekFrom::Start(self.sector << SECTOR_SHIFT))
-        //     .map_err(ExecuteError::Seek)?;
 
         match self.request_type {
             RequestType::In => {
                 if let Err(e) = transfer_engine.push_read(
-                    diskfile.as_raw_fd(),
                     (self.sector << SECTOR_SHIFT) as i64,
                     mem,
                     self.data_addr,
@@ -226,7 +220,6 @@ impl Request {
             }
             RequestType::Out => {
                 if let Err(e) = transfer_engine.push_write(
-                    diskfile.as_raw_fd(),
                     (self.sector << SECTOR_SHIFT) as i64,
                     mem,
                     self.data_addr,
@@ -245,10 +238,14 @@ impl Request {
             RequestType::Flush => {
                 match cache_type {
                     CacheType::Writeback => {
-                        // flush() first to force any cached data out.
-                        diskfile.flush().map_err(ExecuteError::Flush)?;
-                        // Sync data out to physical media on host.
-                        diskfile.sync_all().map_err(ExecuteError::SyncAll)?;
+                        if let Err(e) = transfer_engine.push_flush(TransferUserData {
+                            request_type: RequestType::Flush,
+                            status_addr: self.status_addr.raw_value(),
+                            head_index,
+                            len: self.data_len,
+                        }) {
+                            error!("Error sending RequestType::Flush: {:?}", e);
+                        }
                         METRICS.block.flush_count.inc();
                     }
                     CacheType::Unsafe => {

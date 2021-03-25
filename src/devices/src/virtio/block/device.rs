@@ -92,10 +92,6 @@ impl DiskProperties {
         })
     }
 
-    pub fn file_mut(&mut self) -> &mut File {
-        &mut self.file
-    }
-
     pub fn nsectors(&self) -> u64 {
         self.nsectors
     }
@@ -365,7 +361,11 @@ impl Block {
                 }
             }
 
-            if request_type != RequestType::In && request_type != RequestType::Out {
+            if request_type != RequestType::In
+                && request_type != RequestType::Out
+                && (request_type != RequestType::Flush
+                    || self.disk.cache_type() != CacheType::Writeback)
+            {
                 queue.add_used(mem, head.index, len).unwrap_or_else(|e| {
                     error!(
                         "Failed to add available descriptor head {}: {}",

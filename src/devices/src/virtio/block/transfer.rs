@@ -1,7 +1,7 @@
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use super::QUEUE_SIZE;
-use io_uring::{IoUring};
+use io_uring::IoUring;
 use utils::eventfd::EventFd;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap};
 
@@ -59,7 +59,6 @@ impl IoUringTransferEngine {
 
     pub fn push_read<T>(
         &mut self,
-        fd: RawFd,
         offset: i64,
         mem: &GuestMemoryMmap,
         addr: GuestAddress,
@@ -93,7 +92,6 @@ impl IoUringTransferEngine {
 
     pub fn push_write<T>(
         &mut self,
-        fd: RawFd,
         offset: i64,
         mem: &GuestMemoryMmap,
         addr: GuestAddress,
@@ -121,6 +119,22 @@ impl IoUringTransferEngine {
         .offset(offset)
         .build()
         .user_data(Box::into_raw(boxed_user_data) as u64);
+
+        self.push_sqe(sqe).map_err(|_| Error::FullSq)
+    }
+
+    pub fn push_flush<T>(&mut self, user_data: T) -> Result<(), Error> {
+        let boxed_user_data = Box::new(IoUringUserData {
+            iovec: [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }],
+            user_data: user_data,
+        });
+
+        let sqe = io_uring::opcode::Fsync::new(io_uring::opcode::types::Fixed(0))
+            .build()
+            .user_data(Box::into_raw(boxed_user_data) as u64);
 
         self.push_sqe(sqe).map_err(|_| Error::FullSq)
     }
