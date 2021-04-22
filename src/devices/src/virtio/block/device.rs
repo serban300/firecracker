@@ -33,6 +33,7 @@ use crate::Error as DeviceError;
 
 use crate::virtio::transfer::IoUringTransferEngine;
 use serde::{Deserialize, Serialize};
+use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
 /// Configuration options for disk caching.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -216,6 +217,7 @@ impl Block {
         let fd = disk_properties.file.as_raw_fd();
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH);
+        avail_features |= 1u64 << VIRTIO_RING_F_EVENT_IDX;
 
         if is_disk_read_only {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
@@ -258,8 +260,17 @@ impl Block {
 
     /// Process device virtio queue(s).
     pub fn process_virtio_queues(&mut self) {
-        if self.process_queue(0) {
-            let _ = self.signal_used_queue();
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem) => mem.clone(),
+            // This should never happen, it's been already validated in the event handler.
+            DeviceState::Inactive => unreachable!(),
+        };
+
+        loop {
+            self.queues[0].set_avail_event(&mem);
+            if !self.process_queue(0) {
+                break;
+            }
         }
     }
 
@@ -267,8 +278,8 @@ impl Block {
         METRICS.block.rate_limiter_event_count.inc();
         // Upon rate limiter event, call the rate limiter handler
         // and restart processing the queue.
-        if self.rate_limiter.event_handler().is_ok() && self.process_queue(0) {
-            let _ = self.signal_used_queue();
+        if self.rate_limiter.event_handler().is_ok() {
+            self.process_queue(0);
         }
     }
 
@@ -278,10 +289,9 @@ impl Block {
             // This should never happen, it's been already validated in the event handler.
             DeviceState::Inactive => unreachable!(),
         };
-        let queue = &mut self.queues[queue_index];
         let mut used_any = false;
         let mut request_type = RequestType::In;
-        while let Some(head) = queue.pop(mem) {
+        while let Some(head) = self.queues[queue_index].pop(mem) {
             let mut len = 0;
             match Request::parse(&head, mem) {
                 Ok(request) => {
@@ -292,7 +302,7 @@ impl Block {
                     if !self.rate_limiter.consume(1, TokenType::Ops) {
                         // Stop processing the queue and return this descriptor chain to the
                         // avail ring, for later processing.
-                        queue.undo_pop();
+                        self.queues[queue_index].undo_pop();
                         METRICS.block.rate_limiter_throttled_events.inc();
                         break;
                     }
@@ -310,7 +320,7 @@ impl Block {
                             self.rate_limiter.manual_replenish(1, TokenType::Ops);
                             // Stop processing the queue and return this descriptor chain to the
                             // avail ring, for later processing.
-                            queue.undo_pop();
+                            self.queues[queue_index].undo_pop();
                             METRICS.block.rate_limiter_throttled_events.inc();
                             break;
                         }
@@ -366,19 +376,26 @@ impl Block {
                 && (request_type != RequestType::Flush
                     || self.disk.cache_type() != CacheType::Writeback)
             {
-                queue.add_used(mem, head.index, len).unwrap_or_else(|e| {
-                    error!(
-                        "Failed to add available descriptor head {}: {}",
-                        head.index, e
-                    )
-                });
-                used_any = true;
+                self.queues[queue_index]
+                    .add_used(mem, head.index, len)
+                    .unwrap_or_else(|e| {
+                        error!(
+                            "Failed to add available descriptor head {}: {}",
+                            head.index, e
+                        )
+                    });
+                if self.queues[queue_index].needs_notification(mem) {
+                    self.signal_used_queue().unwrap();
+                    self.queues[queue_index].sync();
+                }
             }
+            used_any = true;
         }
 
         if !used_any {
             METRICS.block.no_avail_buffer.inc();
         }
+
         self.io_uring_engine.submit().unwrap();
 
         used_any
@@ -395,7 +412,6 @@ impl Block {
             // This should never happen, it's been already validated in the event handler.
             DeviceState::Inactive => unreachable!(),
         };
-        let queue = &mut self.queues[0];
 
         while let Some(cqe) = self.io_uring_engine.pop_cqe::<TransferUserData>() {
             match cqe {
@@ -411,7 +427,7 @@ impl Block {
                         error!("Failed to write virtio block status: {:?}", e)
                     }
 
-                    queue
+                    self.queues[0]
                         .add_used(mem, user_data.head_index, len)
                         .unwrap_or_else(|e| {
                             error!(
@@ -419,6 +435,10 @@ impl Block {
                                 user_data.head_index, e
                             )
                         });
+                    if self.queues[0].needs_notification(mem) {
+                        self.signal_used_queue().unwrap();
+                        self.queues[0].sync();
+                    }
                 }
                 Err((e, user_data)) => {
                     error!(
@@ -427,10 +447,6 @@ impl Block {
                     );
                 }
             }
-        }
-
-        if self.io_uring_engine.unprocessed() == 0 {
-            self.signal_used_queue().unwrap();
         }
     }
 

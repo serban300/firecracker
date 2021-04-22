@@ -186,6 +186,9 @@ pub struct Queue {
 
     pub(crate) next_avail: Wrapping<u16>,
     pub(crate) next_used: Wrapping<u16>,
+
+    /// Added used buffers since last sync
+    pub(crate) signalled_used: Wrapping<u16>,
 }
 
 impl Queue {
@@ -200,6 +203,7 @@ impl Queue {
             used_ring: GuestAddress(0),
             next_avail: Wrapping(0),
             next_used: Wrapping(0),
+            signalled_used: Wrapping(0),
         }
     }
 
@@ -391,6 +395,48 @@ impl Queue {
         //       the last `self.is_valid()` check.
         let addr = self.avail_ring.unchecked_add(2);
         Wrapping(mem.read_obj::<u16>(addr).unwrap())
+    }
+
+    pub fn used_event(&self, mem: &GuestMemoryMmap) -> Wrapping<u16> {
+        // We need to find the `used_event` field from the avail ring.
+        let used_event_addr = 4 + 2 * self.actual_size();
+
+        // This fence ensures we're seeing the latest update from the guest.
+        fence(Ordering::SeqCst);
+
+        let event: u16 = mem
+            .read_obj::<u16>(self.avail_ring.unchecked_add(u64::from(used_event_addr)))
+            .unwrap();
+
+        return Wrapping(event);
+    }
+
+    pub fn set_avail_event(&mut self, mem: &GuestMemoryMmap) {
+        let avail_event_addr = 4 + 8 * self.actual_size();
+        mem.write_obj(
+            self.avail_idx(mem).0,
+            self.used_ring.unchecked_add(u64::from(avail_event_addr)),
+        )
+        .unwrap();
+
+        // This fence ensures the guest sees the value we've just written.
+        fence(Ordering::Release);
+    }
+
+    pub fn needs_notification(&self, mem: &GuestMemoryMmap) -> bool {
+        // Complete all the writes in add_used() before reading the event.
+        fence(Ordering::SeqCst);
+        let used_event = self.used_event(mem);
+
+        if (self.next_used - used_event - Wrapping(1u16)) >= self.next_used - self.signalled_used {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn sync(&mut self) {
+        self.signalled_used = self.next_used
     }
 }
 
