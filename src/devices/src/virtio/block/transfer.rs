@@ -20,8 +20,6 @@ pub struct IoUringUserData<T> {
 pub struct IoUringTransferEngine {
     ring: io_uring::IoUring,
     completion_evt: EventFd,
-    unsubmitted: u32,
-    unprocessed: u32,
 }
 
 impl IoUringTransferEngine {
@@ -36,8 +34,6 @@ impl IoUringTransferEngine {
         Ok(IoUringTransferEngine {
             ring,
             completion_evt,
-            unsubmitted: 0,
-            unprocessed: 0,
         })
     }
 
@@ -53,7 +49,6 @@ impl IoUringTransferEngine {
             }
             sq.sync();
         }
-        self.unsubmitted += 1;
         Ok(())
     }
 
@@ -140,12 +135,7 @@ impl IoUringTransferEngine {
     }
 
     pub fn submit(&mut self) -> Result<(), Error> {
-        if self.unsubmitted > 0 {
-            self.ring.submit().map_err(Error::IOError)?;
-            self.unprocessed += self.unsubmitted;
-            self.unsubmitted = 0;
-        }
-
+        self.ring.submit().map_err(Error::IOError)?;
         Ok(())
     }
 
@@ -170,12 +160,7 @@ impl IoUringTransferEngine {
                 Ok((ret as u32, (*user_data).user_data))
             };
 
-            self.unprocessed -= 1;
             Some(res)
         })
-    }
-
-    pub fn unprocessed(&self) -> u32 {
-        self.unprocessed
     }
 }

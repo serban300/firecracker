@@ -289,7 +289,8 @@ impl Block {
             // This should never happen, it's been already validated in the event handler.
             DeviceState::Inactive => unreachable!(),
         };
-        let mut used_any = false;
+        let mut used_sync = false;
+        let mut used_async = false;
         let mut request_type = RequestType::In;
         while let Some(head) = self.queues[queue_index].pop(mem) {
             let mut len = 0;
@@ -388,17 +389,21 @@ impl Block {
                     self.signal_used_queue().unwrap();
                     self.queues[queue_index].sync();
                 }
+                used_sync = true;
+            } else {
+                used_async = true;
             }
-            used_any = true;
         }
 
-        if !used_any {
+        if !(used_sync || used_async) {
             METRICS.block.no_avail_buffer.inc();
         }
 
-        self.io_uring_engine.submit().unwrap();
+        if used_async {
+            self.io_uring_engine.submit().unwrap();
+        }
 
-        used_any
+        used_sync || used_async
     }
 
     pub(crate) fn process_completion_event(&mut self) {
