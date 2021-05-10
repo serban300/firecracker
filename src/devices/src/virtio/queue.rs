@@ -420,7 +420,7 @@ impl Queue {
         .unwrap();
 
         // This fence ensures the guest sees the value we've just written.
-        fence(Ordering::Release);
+        fence(Ordering::SeqCst);
     }
 
     pub fn needs_notification(&self, mem: &GuestMemoryMmap) -> bool {

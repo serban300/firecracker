@@ -260,18 +260,20 @@ impl Block {
 
     /// Process device virtio queue(s).
     pub fn process_virtio_queues(&mut self) {
-        let mem = match self.device_state {
-            DeviceState::Activated(ref mem) => mem.clone(),
-            // This should never happen, it's been already validated in the event handler.
-            DeviceState::Inactive => unreachable!(),
-        };
+        // let mem = match self.device_state {
+        //     DeviceState::Activated(ref mem) => mem.clone(),
+        //     // This should never happen, it's been already validated in the event handler.
+        //     DeviceState::Inactive => unreachable!(),
+        // };
 
-        loop {
-            self.queues[0].set_avail_event(&mem);
-            if !self.process_queue(0) {
-                break;
-            }
-        }
+        // loop {
+        //     self.queues[0].set_avail_event(&mem);
+        //     if !self.process_queue(0) {
+        //         break;
+        //     }
+        // }
+
+        self.process_queue(0);
     }
 
     pub(crate) fn process_rate_limiter_event(&mut self) {
@@ -385,10 +387,6 @@ impl Block {
                             head.index, e
                         )
                     });
-                if self.queues[queue_index].needs_notification(mem) {
-                    self.signal_used_queue().unwrap();
-                    self.queues[queue_index].sync();
-                }
                 used_sync = true;
             } else {
                 used_async = true;
@@ -397,6 +395,17 @@ impl Block {
 
         if !(used_sync || used_async) {
             METRICS.block.no_avail_buffer.inc();
+        }
+
+        if used_sync || used_async {
+            self.queues[0].set_avail_event(&mem);
+        }
+
+        if used_sync {
+            if self.queues[queue_index].needs_notification(mem) {
+                self.signal_used_queue().unwrap();
+                self.queues[queue_index].sync();
+            }
         }
 
         if used_async {
@@ -440,6 +449,8 @@ impl Block {
                                 user_data.head_index, e
                             )
                         });
+                    // self.queues[0].set_avail_event(&mem);
+
                     if self.queues[0].needs_notification(mem) {
                         self.signal_used_queue().unwrap();
                         self.queues[0].sync();
