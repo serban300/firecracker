@@ -31,6 +31,7 @@ use crate::virtio::VIRTIO_MMIO_INT_CONFIG;
 use crate::Error as DeviceError;
 
 use serde::{Deserialize, Serialize};
+use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
 /// Configuration options for disk caching.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -218,7 +219,9 @@ impl Block {
     ) -> io::Result<Block> {
         let disk_properties = DiskProperties::new(disk_image_path, is_disk_read_only, cache_type)?;
 
-        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH);
+        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_BLK_F_FLUSH)
+            | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
         if is_disk_read_only {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
@@ -260,21 +263,19 @@ impl Block {
 
     /// Process device virtio queue(s).
     pub fn process_virtio_queues(&mut self) {
-        if self.process_queue(0) {
-            let _ = self.signal_used_queue();
-        }
+        self.process_queue(0);
     }
 
     pub(crate) fn process_rate_limiter_event(&mut self) {
         METRICS.block.rate_limiter_event_count.inc();
         // Upon rate limiter event, call the rate limiter handler
         // and restart processing the queue.
-        if self.rate_limiter.event_handler().is_ok() && self.process_queue(0) {
-            let _ = self.signal_used_queue();
+        if self.rate_limiter.event_handler().is_ok() {
+            self.process_queue(0);
         }
     }
 
-    pub fn process_queue(&mut self, queue_index: usize) -> bool {
+    pub fn process_queue(&mut self, queue_index: usize) {
         let mem = match self.device_state {
             DeviceState::Activated(ref mem) => mem,
             // This should never happen, it's been already validated in the event handler.
@@ -284,10 +285,9 @@ impl Block {
         let queue = &mut self.queues[queue_index];
         if queue.is_empty(mem) {
             METRICS.block.no_avail_buffer.inc();
-            return false;
+            return;
         }
 
-        let mut used_any = false;
         while let Some(head) = queue.pop(mem) {
             let len = match Request::parse(&head, mem) {
                 Ok(request) => {
@@ -329,17 +329,23 @@ impl Block {
                     head.index, e
                 )
             });
-            used_any = true;
-        }
 
-        used_any
+            queue.set_avail_event(mem);
+            if queue.needs_notification(mem) {
+                let _ =
+                    Self::signal_used_queue(&mut self.interrupt_status, &mut self.interrupt_evt);
+                queue.after_notification();
+            }
+        }
     }
 
-    pub(crate) fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
-        self.interrupt_status
-            .fetch_or(VIRTIO_MMIO_INT_VRING as usize, Ordering::SeqCst);
+    pub(crate) fn signal_used_queue(
+        interrupt_status: &mut Arc<AtomicUsize>,
+        interrupt_evt: &mut EventFd,
+    ) -> result::Result<(), DeviceError> {
+        interrupt_status.fetch_or(VIRTIO_MMIO_INT_VRING as usize, Ordering::SeqCst);
 
-        self.interrupt_evt.write(1).map_err(|e| {
+        interrupt_evt.write(1).map_err(|e| {
             error!("Failed to signal used queue: {:?}", e);
             METRICS.block.event_fails.inc();
             DeviceError::FailedSignalingUsedQueue(e)
@@ -476,6 +482,9 @@ impl VirtioDevice for Block {
     }
 
     fn activate(&mut self, mem: GuestMemoryMmap) -> ActivateResult {
+        let event_idx = self.has_feature(u64::from(VIRTIO_RING_F_EVENT_IDX));
+        self.queues[0].set_event_idx(event_idx);
+
         if self.activate_evt.write(1).is_err() {
             error!("Block: Cannot write to activate_evt");
             return Err(super::super::ActivateError::BadActivate);
@@ -541,7 +550,9 @@ pub(crate) mod tests {
 
         assert_eq!(block.device_type(), TYPE_BLOCK);
 
-        let features: u64 = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH);
+        let features: u64 = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_BLK_F_FLUSH)
+            | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
         assert_eq!(block.avail_features_by_page(0), features as u32);
         assert_eq!(block.avail_features_by_page(1), (features >> 32) as u32);
