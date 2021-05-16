@@ -92,6 +92,7 @@ use super::super::{Result as VsockResult, VsockChannel, VsockEpollListener, Vsoc
 use super::defs;
 use super::txbuf::TxBuf;
 use super::{ConnState, Error, PendingRx, PendingRxSet, Result};
+use vm_memory::GuestMemoryMmap;
 
 /// A self-managing connection object, that handles communication between a guest-side AF_VSOCK
 /// socket and a host-side `Read + Write + AsRawFd` stream.
@@ -150,7 +151,7 @@ where
     ///    packet;
     /// - `Err(VsockError::PktBufMissing)`: the packet would've been filled in with data, but
     ///    it is missing the data buffer.
-    fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> VsockResult<()> {
+    fn recv_pkt(&mut self, pkt: &mut VsockPacket, _mem: &GuestMemoryMmap) -> VsockResult<()> {
         // Perform some generic initialization that is the same for any packet operation (e.g.
         // source, destination, credit, etc).
         self.init_pkt(pkt);
@@ -840,7 +841,7 @@ mod tests {
                         PEER_BUF_ALLOC,
                     );
                     assert!(conn.has_pending_rx());
-                    conn.recv_pkt(&mut pkt).unwrap();
+                    conn.recv_pkt(&mut pkt, &vsock_test_ctx.mem).unwrap();
                     assert_eq!(pkt.op(), uapi::VSOCK_OP_RESPONSE);
                     conn
                 }
@@ -870,7 +871,9 @@ mod tests {
         }
 
         fn recv(&mut self) {
-            self.conn.recv_pkt(&mut self.pkt).unwrap();
+            self.conn
+                .recv_pkt(&mut self.pkt, &self._vsock_test_ctx.mem)
+                .unwrap();
         }
 
         fn notify_epollin(&mut self) {
@@ -960,7 +963,7 @@ mod tests {
         assert_eq!(ctx.pkt.buf().unwrap()[..ctx.pkt.len() as usize], *data);
 
         // There's no more data in the stream, so `recv_pkt` should yield `VsockError::NoData`.
-        match ctx.conn.recv_pkt(&mut ctx.pkt) {
+        match ctx.conn.recv_pkt(&mut ctx.pkt, &ctx._vsock_test_ctx.mem) {
             Err(VsockError::NoData) => (),
             other => panic!("{:?}", other),
         }

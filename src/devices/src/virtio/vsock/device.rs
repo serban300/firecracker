@@ -144,7 +144,7 @@ where
         while let Some(head) = self.queues[RXQ_INDEX].pop(mem) {
             let used_len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => {
-                    if self.backend.recv_pkt(&mut pkt).is_ok() {
+                    if self.backend.recv_pkt(&mut pkt, mem).is_ok() {
                         pkt.hdr().len() as u32 + pkt.len()
                     } else {
                         // We are using a consuming iterator over the virtio buffers, so, if we can't

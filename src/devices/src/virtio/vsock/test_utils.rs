@@ -57,7 +57,7 @@ impl Default for TestBackend {
 }
 
 impl VsockChannel for TestBackend {
-    fn recv_pkt(&mut self, _pkt: &mut VsockPacket) -> Result<()> {
+    fn recv_pkt(&mut self, _pkt: &mut VsockPacket, _mem: &GuestMemoryMmap) -> Result<()> {
         let cool_buf = [0xDu8, 0xE, 0xA, 0xD, 0xB, 0xE, 0xE, 0xF];
         match self.rx_err.take() {
             None => {
