@@ -93,6 +93,7 @@ const HDROFF_FWD_CNT: usize = 40;
 /// - (an optional) data/buffer descriptor, only present for data packets (VSOCK_OP_RW).
 pub struct VsockPacket {
     hdr: *mut u8,
+    buf_addr: Option<GuestAddress>,
     buf: Option<*mut u8>,
     buf_size: usize,
 }
@@ -126,6 +127,7 @@ impl VsockPacket {
         let mut pkt = Self {
             hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
                 .map_err(VsockError::GuestMemoryMmap)?,
+            buf_addr: None,
             buf: None,
             buf_size: 0,
         };
@@ -190,12 +192,21 @@ impl VsockPacket {
         Ok(Self {
             hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
                 .map_err(VsockError::GuestMemoryMmap)?,
+            buf_addr: Some(buf_desc.addr),
             buf: Some(
                 get_host_address(buf_desc.mem, buf_desc.addr, buf_size)
                     .map_err(VsockError::GuestMemoryMmap)?,
             ),
             buf_size,
         })
+    }
+
+    pub fn buf_addr(&self) -> Option<GuestAddress> {
+        self.buf_addr
+    }
+
+    pub fn buf_size(&self) -> usize {
+        self.buf_size
     }
 
     /// Provides in-place, byte-slice, access to the vsock packet header.
