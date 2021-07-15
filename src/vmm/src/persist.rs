@@ -128,6 +128,8 @@ pub enum CreateSnapshotError {
     #[cfg(target_arch = "x86_64")]
     /// Number of devices exceeds the maximum supported devices for the snapshot data version.
     TooManyDevices(usize),
+    /// The virtio devices use a feature that is not supported for the snapshot data version.
+    UnsupportedVirtioFeature,
 }
 
 impl Display for CreateSnapshotError {
@@ -161,6 +163,10 @@ impl Display for CreateSnapshotError {
                 "Too many devices attached: {}. The maximum number allowed \
                  for the snapshot data version requested is {}.",
                 val, FC_V0_23_MAX_DEVICES
+            ),
+            UnsupportedVirtioFeature => write!(
+                f,
+                "The virtio devices use a feature that is not supported for the snapshot data version."
             ),
         }
     }
@@ -309,13 +315,18 @@ pub fn get_snapshot_data_version(
         .map_err(|_| CreateSnapshotError::InvalidVersionFormat)?;
 
     match FC_VERSION_TO_SNAP_VERSION.get_key_value(&fc_version) {
-        Some((_fc_version, &data_version)) => {
+        Some((fc_version, &data_version)) => {
             #[cfg(target_arch = "x86_64")]
-            if _fc_version <= &FC_VERSION_0_23_0 {
+            if fc_version <= &FC_VERSION_0_23_0 {
                 let num_devices = _vmm.mmio_device_manager.used_irqs_count();
                 if num_devices > FC_V0_23_MAX_DEVICES {
                     return Err(CreateSnapshotError::TooManyDevices(num_devices));
                 }
+            }
+            if fc_version < &FC_VERSION_0_26_0 {
+                // Firecracker 0.26.0 adds support for notification suppression.
+                // The devices that use this feature won't work on previous Firecracker versions.
+                return Err(CreateSnapshotError::UnsupportedVirtioFeature);
             }
             Ok(data_version)
         }
